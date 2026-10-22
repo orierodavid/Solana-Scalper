@@ -1,0 +1,17 @@
+{
+  "name": "solana-scalper",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js",
+    "wallet": "node generate-wallet.js"
+  },
+  "dependencies": {
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.98.0",
+    "bs58": "^5.0.0",
+    "dotenv": "^16.4.5",
+    "ws": "^8.18.0"
+  }
+}

@@ -1,0 +1,25 @@
+name: bot
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # every 5 minutes. Edit hours here to save minutes, e.g. '*/5 12-22 * * *'
+  workflow_dispatch:
+concurrency:
+  group: bot
+  cancel-in-progress: false
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install --no-audit --no-fund
+      - run: node bot.js
+        env:
+          BOT_WALLET_PRIVATE_KEY: ${{ secrets.BOT_WALLET_PRIVATE_KEY }}
+          HELIUS_RPC_URL: ${{ secrets.HELIUS_RPC_URL }}
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
+          TRADE_SOL: ${{ vars.TRADE_SOL || '0.002' }}
+          MIN_BALANCE_SOL: ${{ vars.MIN_BALANCE_SOL || '0' }}

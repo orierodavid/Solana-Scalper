@@ -21,12 +21,12 @@ const C = {
 
   // entry filters (tune after you see real results)
   MIN_OBSERVE_SECONDS: num('MIN_OBSERVE_SECONDS', 5),
-  MAX_OBSERVE_SECONDS: num('MAX_OBSERVE_SECONDS', 25),
-  MIN_UNIQUE_BUYERS: num('MIN_UNIQUE_BUYERS', 5),
+  MAX_OBSERVE_SECONDS: num('MAX_OBSERVE_SECONDS', 40),
+  MIN_UNIQUE_BUYERS: num('MIN_UNIQUE_BUYERS', 3),
   MAX_DEV_BUY_SOL: num('MAX_DEV_BUY_SOL', 1.5),
   MAX_MCAP_SOL: num('MAX_MCAP_SOL', 45),
   MAX_PRICE_RISE: num('MAX_PRICE_RISE', 0.6),     // skip if already up more than 60% since launch
-  MIN_BUY_SELL_RATIO: num('MIN_BUY_SELL_RATIO', 2),
+  MIN_BUY_SELL_RATIO: num('MIN_BUY_SELL_RATIO', 1.5),
 
   // exits
   STOP_LOSS: num('STOP_LOSS', 0.25),              // sell all at -25% (before first take-profit)
@@ -53,6 +53,7 @@ let endAt = now() + C.SESSION_SECONDS * 1000;
 let ending = false;
 let ws;
 const watch = new Map(); // mint -> token being observed
+const stats = { created: 0, devBig: 0, tradeEvents: 0, maxBuyers: 0, entered: 0 };
 let pos = null;          // the one open position
 let entering = false;
 
@@ -185,8 +186,9 @@ function onEvent(m) {
   const price = priceOf(m);
 
   if (m.txType === 'create') {
+    stats.created++;
     if (watch.size >= 40 || !price) return;
-    if (Number(m.solAmount || 0) > C.MAX_DEV_BUY_SOL) return; // dev bought too much
+    if (Number(m.solAmount || 0) > C.MAX_DEV_BUY_SOL) { stats.devBig++; return; } // dev bought too much
     watch.set(m.mint, {
       mint: m.mint, dev: m.traderPublicKey, name: m.symbol || m.name || m.mint.slice(0, 6),
       createdAt: now(), startPrice: price, price, mcap: Number(m.marketCapSol || 0),
@@ -201,10 +203,11 @@ function onEvent(m) {
   if (!w && !isPos) return;
   const sol = Number(m.solAmount || 0);
   const who = m.traderPublicKey;
+  stats.tradeEvents++;
 
   if (w) {
     if (price) { w.price = price; w.mcap = Number(m.marketCapSol || w.mcap); }
-    if (m.txType === 'buy') { if (who !== w.dev) w.buyers.add(who); w.buySol += sol; }
+    if (m.txType === 'buy') { if (who !== w.dev) w.buyers.add(who); w.buySol += sol; stats.maxBuyers = Math.max(stats.maxBuyers, w.buyers.size); }
     if (m.txType === 'sell') { if (who === w.dev) w.devSold = true; else w.sellers.add(who); w.sellSol += sol; }
   }
   if (isPos) {
@@ -232,6 +235,7 @@ function maybeEnter(w) {
 
 async function enter(w) {
   entering = true;
+  stats.entered++;
   try {
     const entryPrice = w.price;
     log(`ENTER ${w.name} ${w.mint} buyers=${w.buyers.size} buySol=${w.buySol.toFixed(2)} mcap=${w.mcap.toFixed(1)}`);
@@ -353,6 +357,7 @@ async function main() {
   await sweepHoldings();
   await reclaimRent();
   const end = (await conn.getBalance(wallet.publicKey)) / 1e9;
+  log('stats', JSON.stringify(stats));
   log(`done | balance ${end.toFixed(4)} SOL (started ${bal.toFixed(4)})`);
 }
 

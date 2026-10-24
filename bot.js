@@ -3,7 +3,7 @@
 import 'dotenv/config';
 import WebSocket from 'ws';
 import bs58 from 'bs58';
-import { Connection, Keypair, Transaction, VersionedTransaction } from '@solana/web3.js';
+import { Connection, Keypair, PublicKey, Transaction, VersionedTransaction } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, createCloseAccountInstruction } from '@solana/spl-token';
 
 const env = (k, d) => (process.env[k] !== undefined && process.env[k] !== '' ? process.env[k] : d);
@@ -22,11 +22,13 @@ const C = {
   // entry filters (tune after you see real results)
   MIN_OBSERVE_SECONDS: num('MIN_OBSERVE_SECONDS', 5),
   MAX_OBSERVE_SECONDS: num('MAX_OBSERVE_SECONDS', 40),
-  MIN_UNIQUE_BUYERS: num('MIN_UNIQUE_BUYERS', 3),
+  POLL_MS: num('POLL_MS', 1500),                  // how often to read bonding curves from the chain
+  MIN_INFLOW_SOL: num('MIN_INFLOW_SOL', 1.5),     // net SOL that flowed into the curve since we started watching
+  MAX_SINGLE_DROP: num('MAX_SINGLE_DROP', 0.10),  // skip tokens that dumped >10% in one poll while watched
+  DUMP_DROP: num('DUMP_DROP', 0.15),              // sell all if price drops >15% between two polls
   MAX_DEV_BUY_SOL: num('MAX_DEV_BUY_SOL', 1.5),
   MAX_MCAP_SOL: num('MAX_MCAP_SOL', 45),
   MAX_PRICE_RISE: num('MAX_PRICE_RISE', 0.6),     // skip if already up more than 60% since launch
-  MIN_BUY_SELL_RATIO: num('MIN_BUY_SELL_RATIO', 1.5),
 
   // exits
   STOP_LOSS: num('STOP_LOSS', 0.25),              // sell all at -25% (before first take-profit)
@@ -54,7 +56,8 @@ let ending = false;
 let ws;
 const watch = new Map(); // mint -> token being observed
 let dbg = 0;
-const stats = { created: 0, devBig: 0, tradeEvents: 0, maxBuyers: 0, entered: 0 };
+let polling = false;
+const stats = { created: 0, devBig: 0, polls: 0, maxInflow: 0, maxRise: 0, entered: 0 };
 let pos = null;          // the one open position
 let entering = false;
 
@@ -158,66 +161,97 @@ async function reclaimRent() {
 }
 
 // ---------- market data ----------
-const wsSend = (o) => ws && ws.readyState === WebSocket.OPEN && ws.send(JSON.stringify(o));
+// PumpPortal's trade feed needs a paid key, so we only use the free new-token feed
+// and read each token's bonding curve directly from the chain (via your RPC).
+const PUMP_PROGRAM = new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P');
+const curveAddress = (mint) =>
+  PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), new PublicKey(mint).toBuffer()], PUMP_PROGRAM)[0];
+
+function parseCurve(data) {
+  if (!data || data.length < 49) return null;
+  const b = Buffer.from(data);
+  const vTok = b.readBigUInt64LE(8);   // virtual token reserves
+  const vSol = b.readBigUInt64LE(16);  // virtual SOL reserves
+  const rSol = b.readBigUInt64LE(32);  // real SOL reserves (net SOL in the curve)
+  const complete = b[48] === 1;        // migrated off the curve
+  if (vTok === 0n) return null;
+  return { price: Number(vSol) / 1e9 / (Number(vTok) / 1e6), realSol: Number(rSol) / 1e9, complete };
+}
 
 function connectWs() {
   ws = new WebSocket('wss://pumpportal.fun/api/data');
   ws.on('open', () => {
     log('ws connected');
-    wsSend({ method: 'subscribeNewToken' });
-    const keys = [...watch.keys()];
-    if (keys.length) wsSend({ method: 'subscribeTokenTrade', keys });
+    ws.send(JSON.stringify({ method: 'subscribeNewToken' }));
   });
   ws.on('message', (raw) => {
     let m;
     try { m = JSON.parse(raw.toString()); } catch { return; }
-    if (dbg < 8 && m.txType !== 'create') { dbg++; log('raw', raw.toString().slice(0, 300)); }
-    onEvent(m);
+    if (dbg < 3 && m.txType !== 'create') { dbg++; log('raw', raw.toString().slice(0, 200)); }
+    onCreate(m);
   });
   ws.on('close', () => { if (!ending) setTimeout(connectWs, 1000); });
   ws.on('error', (e) => log('ws error', e.message));
 }
 
-const priceOf = (m) => {
-  const s = Number(m.vSolInBondingCurve), t = Number(m.vTokensInBondingCurve);
-  return s > 0 && t > 0 ? s / t : null;
-};
+function onCreate(m) {
+  if (m.txType !== 'create' || !m.mint) return;
+  const s0 = Number(m.vSolInBondingCurve), t0 = Number(m.vTokensInBondingCurve);
+  if (!(s0 > 0 && t0 > 0)) return;
+  stats.created++;
+  if (watch.size >= 40) return;
+  if (Number(m.solAmount || 0) > C.MAX_DEV_BUY_SOL) { stats.devBig++; return; }
+  let bc;
+  try { bc = curveAddress(m.mint); } catch { return; }
+  const price = s0 / t0;
+  watch.set(m.mint, {
+    mint: m.mint, bc, dev: m.traderPublicKey, name: m.symbol || m.name || m.mint.slice(0, 6),
+    createdAt: now(), startPrice: price, price, mcap: price * 1e9,
+    baseSol: null, baseAt: 0, realSol: 0, maxDrop: 0, complete: false, samples: [],
+  });
+}
 
-function onEvent(m) {
-  if (!m.mint || !m.txType) return;
-  const price = priceOf(m);
-
-  if (m.txType === 'create') {
-    stats.created++;
-    if (watch.size >= 40 || !price) return;
-    if (Number(m.solAmount || 0) > C.MAX_DEV_BUY_SOL) { stats.devBig++; return; } // dev bought too much
-    watch.set(m.mint, {
-      mint: m.mint, dev: m.traderPublicKey, name: m.symbol || m.name || m.mint.slice(0, 6),
-      createdAt: now(), startPrice: price, price, mcap: Number(m.marketCapSol || 0),
-      buyers: new Set(), sellers: new Set(), buySol: 0, sellSol: 0, devSold: false,
+async function poll() {
+  if (polling || ending) return;
+  polling = true;
+  try {
+    const items = [...watch.values()];
+    if (!items.length) return;
+    const infos = await conn.getMultipleAccountsInfo(items.map((w) => w.bc));
+    stats.polls++;
+    infos.forEach((info, i) => {
+      const c = info && parseCurve(info.data);
+      if (c) onCurve(items[i], c);
     });
-    wsSend({ method: 'subscribeTokenTrade', keys: [m.mint] });
+  } catch (e) {
+    log('poll error', e.message);
+  } finally {
+    polling = false;
+  }
+}
+
+function onCurve(w, c) {
+  const t = now();
+  const drop = 1 - c.price / w.price; // positive = price fell since last poll
+  w.price = c.price;
+  w.mcap = c.price * 1e9;
+  w.realSol = c.realSol;
+  w.complete = c.complete;
+  if (w.baseSol === null) { w.baseSol = c.realSol; w.baseAt = t; }
+  if (drop > w.maxDrop) w.maxDrop = drop;
+  w.samples.push(c.price);
+  if (w.samples.length > 4) w.samples.shift();
+
+  if (pos && pos.mint === w.mint) {
+    pos.price = c.price;
+    pos.peak = Math.max(pos.peak, c.price);
+    pos.lastEventAt = t;
+    if (drop >= C.DUMP_DROP) pos.dumped = true;
     return;
   }
-
-  const w = watch.get(m.mint);
-  const isPos = pos && pos.mint === m.mint;
-  if (!w && !isPos) return;
-  const sol = Number(m.solAmount || 0);
-  const who = m.traderPublicKey;
-  stats.tradeEvents++;
-
-  if (w) {
-    if (price) { w.price = price; w.mcap = Number(m.marketCapSol || w.mcap); }
-    if (m.txType === 'buy') { if (who !== w.dev) w.buyers.add(who); w.buySol += sol; stats.maxBuyers = Math.max(stats.maxBuyers, w.buyers.size); }
-    if (m.txType === 'sell') { if (who === w.dev) w.devSold = true; else w.sellers.add(who); w.sellSol += sol; }
-  }
-  if (isPos) {
-    if (price) { pos.price = price; pos.peak = Math.max(pos.peak, price); }
-    pos.lastEventAt = now();
-    if (m.txType === 'sell' && who === pos.dev) pos.devSold = true;
-  }
-  if (w) maybeEnter(w);
+  stats.maxInflow = Math.max(stats.maxInflow, c.realSol - w.baseSol);
+  stats.maxRise = Math.max(stats.maxRise, c.price / w.startPrice - 1);
+  maybeEnter(w);
 }
 
 // ---------- entry ----------
@@ -226,12 +260,14 @@ function maybeEnter(w) {
   if (now() > endAt - C.NO_ENTRY_LAST_SECONDS * 1000) return;
   const age = (now() - w.createdAt) / 1000;
   if (age < C.MIN_OBSERVE_SECONDS || age > C.MAX_OBSERVE_SECONDS) return;
-  if (w.devSold) return;
-  if (w.buyers.size < C.MIN_UNIQUE_BUYERS) return;
-  if (w.buySol < Math.max(w.sellSol, 0.0001) * C.MIN_BUY_SELL_RATIO) return;
+  if (w.complete || w.baseSol === null) return;
+  if (w.maxDrop > C.MAX_SINGLE_DROP) return;                       // had a sharp dump
+  if (w.realSol - w.baseSol < C.MIN_INFLOW_SOL) return;            // not enough net buying
   if (w.mcap > C.MAX_MCAP_SOL) return;
   const rise = w.price / w.startPrice - 1;
   if (rise < 0 || rise > C.MAX_PRICE_RISE) return;
+  const n = w.samples.length;
+  if (n >= 3 && w.samples[n - 1] < w.samples[n - 3]) return;       // momentum fading
   enter(w);
 }
 
@@ -240,20 +276,19 @@ async function enter(w) {
   stats.entered++;
   try {
     const entryPrice = w.price;
-    log(`ENTER ${w.name} ${w.mint} buyers=${w.buyers.size} buySol=${w.buySol.toFixed(2)} mcap=${w.mcap.toFixed(1)}`);
+    log(`ENTER ${w.name} ${w.mint} inflow=${(w.realSol - w.baseSol).toFixed(2)}SOL mcap=${w.mcap.toFixed(1)} rise=${((w.price / w.startPrice - 1) * 100).toFixed(0)}%`);
     if (!C.DRY_RUN) {
       const sig = await trade('buy', w.mint, C.TRADE_SOL, true, C.BUY_SLIPPAGE, 'pump');
       if (!sig) {
         log('buy failed, skipping token');
         watch.delete(w.mint);
-        wsSend({ method: 'unsubscribeTokenTrade', keys: [w.mint] });
         return;
       }
     }
     pos = {
-      mint: w.mint, name: w.name, dev: w.dev, entry: entryPrice, price: w.price, peak: Math.max(entryPrice, w.price),
+      mint: w.mint, name: w.name, dev: w.dev, entry: entryPrice, price: w.price, peak: Math.max(entryPrice, w.price), dumped: false,
       enteredAt: now(), lastEventAt: now(), stage: 0, remainingPct: 100, realized: 0,
-      selling: false, sellFails: 0, devSold: w.devSold,
+      selling: false, sellFails: 0,
     };
   } finally {
     entering = false;
@@ -278,7 +313,6 @@ async function sell(pct, reason, nextStage) {
     if (p.sellFails >= 6) {
       log(`giving up on ${p.name}, leftover tokens will be swept next run`);
       watch.delete(p.mint);
-      wsSend({ method: 'unsubscribeTokenTrade', keys: [p.mint] });
       pos = null;
     }
     return;
@@ -291,7 +325,6 @@ async function sell(pct, reason, nextStage) {
   if (pct >= 100 || p.remainingPct <= 0.5) {
     log(`CLOSED ${p.name} estimated result ${p.realized.toFixed(2)}x (before fees)`);
     watch.delete(p.mint);
-    wsSend({ method: 'unsubscribeTokenTrade', keys: [p.mint] });
     pos = null;
     reclaimRent();
   }
@@ -301,7 +334,6 @@ async function tick() {
   for (const [mint, w] of watch) {
     if ((now() - w.createdAt) / 1000 > C.MAX_OBSERVE_SECONDS + 2 && !(pos && pos.mint === mint) && !(entering)) {
       watch.delete(mint);
-      wsSend({ method: 'unsubscribeTokenTrade', keys: [mint] });
     }
   }
   if (!pos || pos.selling || entering) return;
@@ -309,11 +341,11 @@ async function tick() {
   const mult = pos.price / pos.entry;
   const heldSec = (now() - pos.enteredAt) / 1000;
   let reason = null;
-  if (pos.devSold) reason = 'dev sold';
+  if (pos.dumped) reason = 'dump detected';
   else if (now() >= endAt) reason = 'session end';
   else if (pos.stage === 0 && mult <= 1 - C.STOP_LOSS) reason = 'stop loss';
   else if (pos.stage === 0 && heldSec > C.TIME_STOP_SECONDS && mult < 1.3) reason = 'time stop';
-  else if ((now() - pos.lastEventAt) / 1000 > C.STALE_SECONDS) reason = 'no activity';
+  else if ((now() - pos.lastEventAt) / 1000 > C.STALE_SECONDS) reason = 'no price updates';
   else if (mult >= C.TP3) reason = 'tp3';
   else if (pos.stage >= 1 && pos.price <= pos.peak * (1 - C.TRAIL)) reason = 'trailing stop';
   if (reason) return sell(100, reason);
@@ -344,6 +376,7 @@ async function main() {
 
   endAt = now() + C.SESSION_SECONDS * 1000;
   connectWs();
+  const pollTimer = setInterval(poll, C.POLL_MS);
 
   await new Promise((resolve) => {
     const iv = setInterval(async () => {
@@ -355,6 +388,7 @@ async function main() {
   });
 
   ending = true;
+  clearInterval(pollTimer);
   try { ws.close(); } catch {}
   await sweepHoldings();
   await reclaimRent();

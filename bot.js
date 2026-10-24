@@ -28,7 +28,7 @@ const C = {
   DUMP_DROP: num('DUMP_DROP', 0.15),              // sell all if price drops >15% between two polls
   MAX_DEV_BUY_SOL: num('MAX_DEV_BUY_SOL', 1.5),
   MAX_MCAP_SOL: num('MAX_MCAP_SOL', 38),
-  MAX_PRICE_RISE: num('MAX_PRICE_RISE', 0.3),     // skip if already up more than 60% since launch
+  MAX_PRICE_RISE: num('MAX_PRICE_RISE', 0.3),     // skip if already up more than 30% since we started watching
 
   // exits
   STOP_LOSS: num('STOP_LOSS', 0.25),              // sell all at -25% (before first take-profit)
@@ -237,7 +237,7 @@ function onCurve(w, c) {
   w.mcap = c.price * 1e9;
   w.realSol = c.realSol;
   w.complete = c.complete;
-  if (w.baseSol === null) { w.baseSol = c.realSol; w.baseAt = t; }
+  if (w.baseSol === null) { w.baseSol = c.realSol; w.baseAt = t; w.startPrice = c.price; }
   if (drop > w.maxDrop) w.maxDrop = drop;
   w.samples.push(c.price);
   if (w.samples.length > 4) w.samples.shift();

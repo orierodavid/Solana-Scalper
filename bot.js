@@ -27,8 +27,8 @@ const C = {
   MAX_SINGLE_DROP: num('MAX_SINGLE_DROP', 0.10),  // skip tokens that dumped >10% in one poll while watched
   DUMP_DROP: num('DUMP_DROP', 0.15),              // sell all if price drops >15% between two polls
   MAX_DEV_BUY_SOL: num('MAX_DEV_BUY_SOL', 1.5),
-  MAX_MCAP_SOL: num('MAX_MCAP_SOL', 45),
-  MAX_PRICE_RISE: num('MAX_PRICE_RISE', 0.6),     // skip if already up more than 60% since launch
+  MAX_MCAP_SOL: num('MAX_MCAP_SOL', 38),
+  MAX_PRICE_RISE: num('MAX_PRICE_RISE', 0.3),     // skip if already up more than 60% since launch
 
   // exits
   STOP_LOSS: num('STOP_LOSS', 0.25),              // sell all at -25% (before first take-profit)

@@ -53,6 +53,7 @@ let endAt = now() + C.SESSION_SECONDS * 1000;
 let ending = false;
 let ws;
 const watch = new Map(); // mint -> token being observed
+let dbg = 0;
 const stats = { created: 0, devBig: 0, tradeEvents: 0, maxBuyers: 0, entered: 0 };
 let pos = null;          // the one open position
 let entering = false;
@@ -170,6 +171,7 @@ function connectWs() {
   ws.on('message', (raw) => {
     let m;
     try { m = JSON.parse(raw.toString()); } catch { return; }
+    if (dbg < 8 && m.txType !== 'create') { dbg++; log('raw', raw.toString().slice(0, 300)); }
     onEvent(m);
   });
   ws.on('close', () => { if (!ending) setTimeout(connectWs, 1000); });
